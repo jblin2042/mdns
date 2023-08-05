@@ -1,23 +1,11 @@
 
-#ifdef _WIN32
-#define _CRT_SECURE_NO_WARNINGS 1
-#endif
-
 #include <stdio.h>
-
 #include <errno.h>
 #include <signal.h>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <iphlpapi.h>
-#define sleep(x) Sleep(x * 1000)
-#else
 #include <netdb.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <sys/time.h>
-#endif
 
 // Alias some things to simulate recieving data to fuzz library
 #if defined(MDNS_FUZZING)
@@ -456,115 +444,6 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 	// Thus we need to open one socket for each interface and address family
 	int num_sockets = 0;
 
-#ifdef _WIN32
-
-	IP_ADAPTER_ADDRESSES* adapter_address = 0;
-	ULONG address_size = 8000;
-	unsigned int ret;
-	unsigned int num_retries = 4;
-	do {
-		adapter_address = (IP_ADAPTER_ADDRESSES*)malloc(address_size);
-		ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST, 0,
-		                           adapter_address, &address_size);
-		if (ret == ERROR_BUFFER_OVERFLOW) {
-			free(adapter_address);
-			adapter_address = 0;
-			address_size *= 2;
-		} else {
-			break;
-		}
-	} while (num_retries-- > 0);
-
-	if (!adapter_address || (ret != NO_ERROR)) {
-		free(adapter_address);
-		printf("Failed to get network adapter addresses\n");
-		return num_sockets;
-	}
-
-	int first_ipv4 = 1;
-	int first_ipv6 = 1;
-	for (PIP_ADAPTER_ADDRESSES adapter = adapter_address; adapter; adapter = adapter->Next) {
-		if (adapter->TunnelType == TUNNEL_TYPE_TEREDO)
-			continue;
-		if (adapter->OperStatus != IfOperStatusUp)
-			continue;
-
-		for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress; unicast;
-		     unicast = unicast->Next) {
-			if (unicast->Address.lpSockaddr->sa_family == AF_INET) {
-				struct sockaddr_in* saddr = (struct sockaddr_in*)unicast->Address.lpSockaddr;
-				if ((saddr->sin_addr.S_un.S_un_b.s_b1 != 127) ||
-				    (saddr->sin_addr.S_un.S_un_b.s_b2 != 0) ||
-				    (saddr->sin_addr.S_un.S_un_b.s_b3 != 0) ||
-				    (saddr->sin_addr.S_un.S_un_b.s_b4 != 1)) {
-					int log_addr = 0;
-					if (first_ipv4) {
-						service_address_ipv4 = *saddr;
-						first_ipv4 = 0;
-						log_addr = 1;
-					}
-					has_ipv4 = 1;
-					if (num_sockets < max_sockets) {
-						saddr->sin_port = htons((unsigned short)port);
-						int sock = mdns_socket_open_ipv4(saddr);
-						if (sock >= 0) {
-							sockets[num_sockets++] = sock;
-							log_addr = 1;
-						} else {
-							log_addr = 0;
-						}
-					}
-					if (log_addr) {
-						char buffer[128];
-						mdns_string_t addr = ipv4_address_to_string(buffer, sizeof(buffer), saddr,
-						                                            sizeof(struct sockaddr_in));
-						printf("Local IPv4 address: %.*s\n", MDNS_STRING_FORMAT(addr));
-					}
-				}
-			} else if (unicast->Address.lpSockaddr->sa_family == AF_INET6) {
-				struct sockaddr_in6* saddr = (struct sockaddr_in6*)unicast->Address.lpSockaddr;
-				// Ignore link-local addresses
-				if (saddr->sin6_scope_id)
-					continue;
-				static const unsigned char localhost[] = {0, 0, 0, 0, 0, 0, 0, 0,
-				                                          0, 0, 0, 0, 0, 0, 0, 1};
-				static const unsigned char localhost_mapped[] = {0, 0, 0,    0,    0,    0, 0, 0,
-				                                                 0, 0, 0xff, 0xff, 0x7f, 0, 0, 1};
-				if ((unicast->DadState == NldsPreferred) &&
-				    memcmp(saddr->sin6_addr.s6_addr, localhost, 16) &&
-				    memcmp(saddr->sin6_addr.s6_addr, localhost_mapped, 16)) {
-					int log_addr = 0;
-					if (first_ipv6) {
-						service_address_ipv6 = *saddr;
-						first_ipv6 = 0;
-						log_addr = 1;
-					}
-					has_ipv6 = 1;
-					if (num_sockets < max_sockets) {
-						saddr->sin6_port = htons((unsigned short)port);
-						int sock = mdns_socket_open_ipv6(saddr);
-						if (sock >= 0) {
-							sockets[num_sockets++] = sock;
-							log_addr = 1;
-						} else {
-							log_addr = 0;
-						}
-					}
-					if (log_addr) {
-						char buffer[128];
-						mdns_string_t addr = ipv6_address_to_string(buffer, sizeof(buffer), saddr,
-						                                            sizeof(struct sockaddr_in6));
-						printf("Local IPv6 address: %.*s\n", MDNS_STRING_FORMAT(addr));
-					}
-				}
-			}
-		}
-	}
-
-	free(adapter_address);
-
-#else
-
 	struct ifaddrs* ifaddr = 0;
 	struct ifaddrs* ifa = 0;
 
@@ -647,9 +526,6 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 	}
 
 	freeifaddrs(ifaddr);
-
-#endif
-
 	return num_sockets;
 }
 
@@ -668,15 +544,8 @@ open_service_sockets(int* sockets, int max_sockets) {
 		struct sockaddr_in sock_addr;
 		memset(&sock_addr, 0, sizeof(struct sockaddr_in));
 		sock_addr.sin_family = AF_INET;
-#ifdef _WIN32
-		sock_addr.sin_addr = in4addr_any;
-#else
 		sock_addr.sin_addr.s_addr = INADDR_ANY;
-#endif
 		sock_addr.sin_port = htons(MDNS_PORT);
-#ifdef __APPLE__
-		sock_addr.sin_len = sizeof(struct sockaddr_in);
-#endif
 		int sock = mdns_socket_open_ipv4(&sock_addr);
 		if (sock >= 0)
 			sockets[num_sockets++] = sock;
@@ -688,9 +557,6 @@ open_service_sockets(int* sockets, int max_sockets) {
 		sock_addr.sin6_family = AF_INET6;
 		sock_addr.sin6_addr = in6addr_any;
 		sock_addr.sin6_port = htons(MDNS_PORT);
-#ifdef __APPLE__
-		sock_addr.sin6_len = sizeof(struct sockaddr_in6);
-#endif
 		int sock = mdns_socket_open_ipv6(&sock_addr);
 		if (sock >= 0)
 			sockets[num_sockets++] = sock;
@@ -1146,18 +1012,9 @@ fuzz_mdns(void) {
 
 #endif
 
-#ifdef _WIN32
-BOOL console_handler(DWORD signal) {
-	if (signal == CTRL_C_EVENT) {
-		running = 0;
-	}
-	return TRUE;
-}
-#else
 void signal_handler(int signal) {
 	running = 0;
 }
-#endif
 
 int
 main(int argc, const char* const* argv) {
@@ -1168,29 +1025,12 @@ main(int argc, const char* const* argv) {
 	size_t query_count = 0;
 	int service_port = 42424;
 
-#ifdef _WIN32
-
-	WORD versionWanted = MAKEWORD(1, 1);
-	WSADATA wsaData;
-	if (WSAStartup(versionWanted, &wsaData)) {
-		printf("Failed to initialize WinSock\n");
-		return -1;
-	}
-
-	char hostname_buffer[256];
-	DWORD hostname_size = (DWORD)sizeof(hostname_buffer);
-	if (GetComputerNameA(hostname_buffer, &hostname_size))
-		hostname = hostname_buffer;
-
-	SetConsoleCtrlHandler(console_handler, TRUE);
-#else
-
+ 
 	char hostname_buffer[256];
 	size_t hostname_size = sizeof(hostname_buffer);
 	if (gethostname(hostname_buffer, hostname_size) == 0)
 		hostname = hostname_buffer;
 	signal(SIGINT, signal_handler);
-#endif
 
 	for (int iarg = 0; iarg < argc; ++iarg) {
 		if (strcmp(argv[iarg], "--discovery") == 0) {
@@ -1254,10 +1094,6 @@ main(int argc, const char* const* argv) {
 		ret = service_mdns(hostname, service, service_port);
 	else if (mode == 3)
 		ret = dump_mdns();
-#endif
-
-#ifdef _WIN32
-	WSACleanup();
 #endif
 
 	return 0;
